@@ -11,6 +11,42 @@ app = Flask(__name__)
 # 儲存下載狀態
 downloads = {}
 
+# yt-dlp 配置選項
+def get_ydl_opts(output_path=None):
+    opts = {
+        'quiet': False,
+        'no_warnings': False,
+        'extract_flat': False,
+        # 使用更多的 extractor 參數來避免被偵測
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'skip': ['hls', 'dash']
+            }
+        },
+        # 添加 headers 模擬真實瀏覽器
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        # 添加 cookies（如果有的話）
+        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
+    }
+    
+    if output_path:
+        opts.update({
+            'outtmpl': output_path,
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }]
+        })
+    
+    return opts
+
 def cleanup_old_files():
     """清理超過 1 小時的檔案"""
     downloads_dir = 'downloads'
@@ -21,13 +57,18 @@ def cleanup_old_files():
     for filename in os.listdir(downloads_dir):
         filepath = os.path.join(downloads_dir, filename)
         if os.path.isfile(filepath):
-            if current_time - os.path.getmtime(filepath) > 3600:  # 1 小時
-                os.remove(filepath)
+            if current_time - os.path.getmtime(filepath) > 3600:
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
 
 @app.route('/')
 def home():
     return jsonify({
         "service": "YouTube Downloader API",
+        "version": "2.0",
+        "status": "running",
         "endpoints": {
             "/api/formats": "GET - 列出影片格式 (參數: url)",
             "/api/download": "POST - 下載影片 (參數: url, video_id, audio_id)",
@@ -45,7 +86,9 @@ def list_formats():
         return jsonify({"error": "請提供 URL 參數"}), 400
     
     try:
-        with yt_dlp.YoutubeDL() as ydl:
+        ydl_opts = get_ydl_opts()
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             formats = info.get('formats', [])
             
@@ -60,34 +103,37 @@ def list_formats():
                     "filesize_mb": round((f.get('filesize') or f.get('filesize_approx') or 0) / 1024 / 1024, 1),
                     "vcodec": f.get('vcodec', ''),
                     "acodec": f.get('acodec', ''),
+                    "quality": f.get('quality', 0),
                 })
             
             return jsonify({
                 "title": info.get('title', ''),
                 "duration": info.get('duration', 0),
+                "thumbnail": info.get('thumbnail', ''),
+                "uploader": info.get('uploader', ''),
                 "formats": format_list
             })
     
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e)
+        if "Sign in to confirm" in error_msg or "429" in error_msg:
+            return jsonify({
+                "error": "YouTube 偵測到機器人行為，請稍後再試或使用 Cookies",
+                "details": error_msg,
+                "solution": "請參考文件設定 cookies.txt"
+            }), 429
+        return jsonify({"error": error_msg}), 500
 
 def download_task(task_id, url, video_id, audio_id):
     """背景下載任務"""
     try:
         downloads[task_id]['status'] = 'downloading'
         
-        # 確保下載目錄存在
         os.makedirs('downloads', exist_ok=True)
         
-        ydl_opts = {
-            'outtmpl': f'downloads/{task_id}.%(ext)s',
-            'merge_output_format': 'mp4',
-            'format': f"{video_id}+{audio_id}",
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }]
-        }
+        output_path = f'downloads/{task_id}.%(ext)s'
+        ydl_opts = get_ydl_opts(output_path)
+        ydl_opts['format'] = f"{video_id}+{audio_id}"
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -111,22 +157,19 @@ def download_video():
     if not all([url, video_id, audio_id]):
         return jsonify({"error": "請提供 url, video_id, audio_id"}), 400
     
-    # 生成任務 ID
     task_id = str(uuid.uuid4())
     
-    # 初始化下載狀態
     downloads[task_id] = {
         'status': 'pending',
         'url': url,
         'video_id': video_id,
-        'audio_id': audio_id
+        'audio_id': audio_id,
+        'created_at': time.time()
     }
     
-    # 啟動背景下載
     thread = Thread(target=download_task, args=(task_id, url, video_id, audio_id))
     thread.start()
     
-    # 清理舊檔案
     cleanup_old_files()
     
     return jsonify({
@@ -158,7 +201,7 @@ def download_file(task_id):
     if not os.path.exists(filepath):
         return jsonify({"error": "檔案不存在"}), 404
     
-    return send_file(filepath, as_attachment=True)
+    return send_file(filepath, as_attachment=True, download_name=f"{downloads[task_id].get('title', 'video')}.mp4")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
